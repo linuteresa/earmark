@@ -1,4 +1,4 @@
-Earmark: Like a bookmark, but for listening later.
+Earmark: Like a bookmark, but for listening later. Sign in with Google and your list syncs across every device.
 
 I built this app as a personal utility.
 I spend a lot of time of my day commuting to class, and with my daily schedule, there is barely enough time for me to sit and read articles.

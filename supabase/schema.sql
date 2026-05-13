@@ -13,6 +13,7 @@ create table if not exists public.articles (
   created_at timestamptz default now()
 );
 
+
 create index if not exists articles_user_added_idx
   on public.articles (user_id, added_at desc);
 

@@ -325,6 +325,96 @@ export async function fetchArticleFromURL(url) {
   return parseJinaResponse(raw, clean.startsWith('http') ? clean : `https://${clean}`);
 }
 
+// Paragraph-level patterns that mean "article content is done, stop here"
+const FOOTER_STOP = [
+  /^subscribe\b/i,
+  /^sign[\s-]up\b/i,
+  /^join\s+(our|the|my)\b/i,
+  /^become\s+a\s+member\b/i,
+  /^(related\s+(stories|articles|posts|reads)|more\s+from\b|read\s+next\b|you\s+might\s+also\b|recommended\s+for\s+you\b)/i,
+  /^(written\s+by|about\s+the\s+author|about\s+me|author\s+bio)\b/i,
+  /^follow\s+(me|us)\s+on\b/i,
+  /^(if\s+you\s+(enjoyed|found|liked|loved|got\s+value\s+from)\s+this)/i,
+  /^thanks?\s+for\s+reading\b/i,
+  /^thank\s+you\s+for\s+reading\b/i,
+  /^(get\s+(stories|articles|posts|updates|my\s+writing)\s+(like\s+this\s+)?(in|to|delivered\s+to)\s+your)/i,
+  /^(member[\s-]only\s+story|this\s+is\s+a\s+member[\s-]only)/i,
+  /^(published\s+in\s+·|originally\s+published\s+at\b)/i,
+  /^(advertisement|sponsored\s+(content|post|by)\b)/i,
+  /^(clap\s+if\s+you|if\s+this\s+(post|article|story)\s+(was|helped|resonated))/i,
+  /^(want\s+to\s+(support|buy\s+me|connect))/i,
+  /^(let('s|\s+me)\s+connect\b)/i,
+  /^(you've?\s+reached\s+your\s+(free\s+)?article\s+limit)/i,
+  /^(support\s+(my|this)\s+(work|writing|blog)\b)/i,
+];
+
+// Short standalone lines that are always noise regardless of position
+const NOISE_LINE = [
+  /^(home|about|contact|archive|rss|newsletter|menu|navigation|search|log\s*in|log\s*out|sign\s*in|sign\s*up)$/i,
+  /^[\d,.]+\s*(claps?|likes?|views?|reads?|responses?|comments?)$/i,
+  /^(\d+\s*)?(min(ute)?\s+read|minute\s+read)$/i,
+  /^\d+\s*followers?$/i,
+  /^(follow|unfollow|subscribe|unsubscribe|share|tweet|save|bookmark|print)$/i,
+  /^(twitter|linkedin|facebook|instagram|youtube|github|medium|substack)\s*$/i,
+  /^[·•\-–—|]+$/,
+  /^(\s*\[[\w\s]+\]\s*)+$/, // bare link text like [Read more] [Source]
+];
+
+function stripMarkdown(text) {
+  return text
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')           // images
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')         // links → text
+    .replace(/^#{1,6}\s+/gm, '')                     // headings
+    .replace(/\*\*([^*]+)\*\*/g, '$1')               // bold
+    .replace(/\*([^*]+)\*/g, '$1')                   // italic
+    .replace(/__([^_]+)__/g, '$1')                   // bold alt
+    .replace(/_([^_]+)_/g, '$1')                     // italic alt
+    .replace(/`([^`]+)`/g, '$1')                     // inline code
+    .replace(/^>\s*/gm, '')                          // blockquotes
+    .replace(/^[-*+]\s+/gm, '')                      // bullets
+    .replace(/^\d+\.\s+/gm, '')                      // numbered lists
+    .replace(/^-{3,}$/gm, '')                        // horizontal rules
+    .replace(/\[\^[^\]]+\]/g, '')                    // footnotes
+    .replace(/~~([^~]+)~~/g, '$1');                  // strikethrough
+}
+
+function isFooterParagraph(para) {
+  const first = para.split('\n')[0].trim();
+  return FOOTER_STOP.some(re => re.test(first));
+}
+
+function isNoiseParagraph(para) {
+  const trimmed = para.trim();
+  // Always-noise short lines
+  if (trimmed.length < 60 && NOISE_LINE.some(re => re.test(trimmed))) return true;
+  // Cookie / GDPR banners
+  if (/\b(cookie|gdpr|privacy\s+policy|terms\s+of\s+(service|use))\b/i.test(trimmed) && trimmed.length < 200) return true;
+  // Pure whitespace or punctuation
+  if (/^[\s\W]+$/.test(trimmed)) return true;
+  return false;
+}
+
+function cleanArticleContent(raw) {
+  // Split into paragraphs on double newlines
+  const paragraphs = raw.split(/\n{2,}/);
+  const kept = [];
+
+  for (const para of paragraphs) {
+    const trimmed = para.trim();
+    if (!trimmed) continue;
+
+    // Hit a footer marker — everything from here on is noise
+    if (isFooterParagraph(trimmed)) break;
+
+    // Skip individual noise paragraphs
+    if (isNoiseParagraph(trimmed)) continue;
+
+    kept.push(trimmed);
+  }
+
+  return kept.join('\n\n');
+}
+
 function parseJinaResponse(raw, url) {
   const lines = raw.split('\n');
   let title = '';
@@ -339,20 +429,7 @@ function parseJinaResponse(raw, url) {
   }
 
   const body = bodyStart >= 0 ? lines.slice(bodyStart).join('\n') : raw;
-  const cleaned = body
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-    .replace(/^#{1,6}\s+/gm, '')
-    .replace(/\*\*([^*]+)\*\*/g, '$1')
-    .replace(/\*([^*]+)\*/g, '$1')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/^>\s*/gm, '')
-    .replace(/^[-*+]\s+/gm, '')
-    .replace(/^\d+\.\s+/gm, '')
-    .replace(/^-{3,}$/gm, '')
-    .replace(/\[\^[^\]]+\]/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
+  const cleaned = cleanArticleContent(stripMarkdown(body));
 
   let source = 'Article';
   try {

@@ -1,9 +1,16 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Play, Pause, SkipBack, SkipForward, Plus, Loader2,
   Link2, FileText, Volume2, Headphones, Settings2, Trash2,
   Check, AlertCircle, Gauge, Mic2, ListMusic, Sparkles,
+  Cloud, LogOut, LogIn,
 } from 'lucide-react';
+import {
+  isSupabaseConfigured, useAuth, useLocalStorage, useSpeech,
+  useArticleSync, fetchArticleFromURL,
+  splitIntoSentences, wordCount, estimateDuration,
+  formatTime, formatMinutes, relativeTime, newArticleId,
+} from './lib';
 
 // ─────────────────────────────────────────────────────────────────
 // Theme
@@ -29,265 +36,7 @@ const fontBody = { fontFamily: '"Geist", -apple-system, BlinkMacSystemFont, sans
 const fontMono = { fontFamily: '"Geist Mono", "JetBrains Mono", monospace' };
 
 // ─────────────────────────────────────────────────────────────────
-// localStorage hook — survives across visits, falls back to memory
-// ─────────────────────────────────────────────────────────────────
-function useLocalStorage(key, initialValue) {
-  const [value, setValue] = useState(() => {
-    try {
-      const raw = localStorage.getItem(key);
-      return raw !== null ? JSON.parse(raw) : initialValue;
-    } catch {
-      return initialValue;
-    }
-  });
-  useEffect(() => {
-    try {
-      localStorage.setItem(key, JSON.stringify(value));
-    } catch (e) {
-      // Quota exceeded or localStorage disabled — ignore
-      console.warn('localStorage write failed:', e);
-    }
-  }, [key, value]);
-  return [value, setValue];
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────
-function splitIntoSentences(text) {
-  if (!text) return [];
-  const normalized = text
-    .replace(/\r/g, '')
-    .replace(/\n{2,}/g, ' ¶ ')
-    .replace(/\n/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-  const matches = normalized.match(/[^.!?¶]+(?:[.!?]+["'")\]]*|¶|$)/g);
-  return (matches || [normalized])
-    .map(s => s.replace(/¶/g, '').trim())
-    .filter(s => s.length > 0);
-}
-
-function wordCount(text) {
-  return (text || '').trim().split(/\s+/).filter(Boolean).length;
-}
-
-function estimateDuration(text, rate = 1) {
-  const words = wordCount(text);
-  const wpm = 175 * rate;
-  return Math.max(1, Math.round((words / wpm) * 60));
-}
-
-function formatTime(seconds) {
-  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${m}:${s.toString().padStart(2, '0')}`;
-}
-
-function formatMinutes(seconds) {
-  if (seconds < 60) return `${seconds} sec`;
-  const m = Math.round(seconds / 60);
-  return `${m} min`;
-}
-
-function relativeTime(ts) {
-  if (!ts) return '';
-  const diff = Date.now() - ts;
-  const sec = Math.round(diff / 1000);
-  if (sec < 60) return 'just now';
-  const min = Math.round(sec / 60);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.round(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  const day = Math.round(hr / 24);
-  if (day < 7) return `${day}d ago`;
-  const wk = Math.round(day / 7);
-  if (wk < 4) return `${wk}w ago`;
-  const mo = Math.round(day / 30);
-  return `${mo}mo ago`;
-}
-
-// Fetch article via our own /api endpoint (no CORS, server-side cached)
-async function fetchArticleFromURL(url) {
-  const clean = url.trim();
-  const res = await fetch(`/api/fetch-article?url=${encodeURIComponent(clean)}`);
-  if (!res.ok) {
-    let msg = `Couldn't fetch (status ${res.status})`;
-    try {
-      const j = await res.json();
-      if (j?.error) msg = j.error;
-    } catch {}
-    throw new Error(msg);
-  }
-  const raw = await res.text();
-  return parseJinaResponse(raw, clean.startsWith('http') ? clean : `https://${clean}`);
-}
-
-function parseJinaResponse(raw, url) {
-  const lines = raw.split('\n');
-  let title = '';
-  let author = '';
-  let bodyStart = -1;
-
-  for (let i = 0; i < Math.min(30, lines.length); i++) {
-    const line = lines[i];
-    if (line.startsWith('Title:')) title = line.slice(6).trim();
-    else if (line.startsWith('Author:')) author = line.slice(7).trim();
-    else if (line.startsWith('Markdown Content:')) { bodyStart = i + 1; break; }
-  }
-
-  const body = bodyStart >= 0 ? lines.slice(bodyStart).join('\n') : raw;
-
-  const cleaned = body
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-    .replace(/^#{1,6}\s+/gm, '')
-    .replace(/\*\*([^*]+)\*\*/g, '$1')
-    .replace(/\*([^*]+)\*/g, '$1')
-    .replace(/`([^`]+)`/g, '$1')
-    .replace(/^>\s*/gm, '')
-    .replace(/^[-*+]\s+/gm, '')
-    .replace(/^\d+\.\s+/gm, '')
-    .replace(/^-{3,}$/gm, '')
-    .replace(/\[\^[^\]]+\]/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-
-  let source = 'Article';
-  try {
-    const u = new URL(url);
-    source = u.hostname.replace(/^www\./, '');
-  } catch {}
-
-  return {
-    title: title || 'Untitled article',
-    author: author || '',
-    text: cleaned,
-    source,
-    url,
-    addedAt: Date.now(),
-  };
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Speech engine
-// ─────────────────────────────────────────────────────────────────
-function useSpeech() {
-  const [voices, setVoices] = useState([]);
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const [currentIndex, setCurrentIndex] = useState(0);
-
-  const sentencesRef = useRef([]);
-  const voiceRef = useRef(null);
-  const rateRef = useRef(1);
-  const idxRef = useRef(0);
-  const playingRef = useRef(false);
-  const onCompleteRef = useRef(() => {});
-
-  useEffect(() => {
-    const synth = window.speechSynthesis;
-    if (!synth) return;
-    const load = () => {
-      const all = synth.getVoices();
-      const english = all.filter(v => v.lang && v.lang.toLowerCase().startsWith('en'));
-      const others = all.filter(v => !(v.lang && v.lang.toLowerCase().startsWith('en')));
-      setVoices([...english, ...others]);
-    };
-    load();
-    synth.addEventListener?.('voiceschanged', load);
-    return () => synth.removeEventListener?.('voiceschanged', load);
-  }, []);
-
-  const speakAt = useCallback((i) => {
-    const synth = window.speechSynthesis;
-    if (!synth) return;
-    const sentences = sentencesRef.current;
-    if (i >= sentences.length) {
-      playingRef.current = false;
-      setIsSpeaking(false);
-      onCompleteRef.current();
-      return;
-    }
-    idxRef.current = i;
-    setCurrentIndex(i);
-
-    const u = new SpeechSynthesisUtterance(sentences[i]);
-    if (voiceRef.current) u.voice = voiceRef.current;
-    u.rate = rateRef.current;
-    u.pitch = 1;
-    u.onend = () => {
-      if (!playingRef.current) return;
-      speakAt(idxRef.current + 1);
-    };
-    u.onerror = (e) => {
-      if (e.error && e.error !== 'interrupted' && e.error !== 'canceled') {
-        playingRef.current = false;
-        setIsSpeaking(false);
-      }
-    };
-    synth.speak(u);
-  }, []);
-
-  const load = useCallback((sentences) => {
-    window.speechSynthesis?.cancel();
-    sentencesRef.current = sentences;
-    idxRef.current = 0;
-    setCurrentIndex(0);
-    playingRef.current = false;
-    setIsSpeaking(false);
-  }, []);
-
-  const play = useCallback(() => {
-    if (!sentencesRef.current.length) return;
-    if (playingRef.current) return;
-    playingRef.current = true;
-    setIsSpeaking(true);
-    speakAt(idxRef.current);
-  }, [speakAt]);
-
-  const pause = useCallback(() => {
-    playingRef.current = false;
-    setIsSpeaking(false);
-    window.speechSynthesis?.cancel();
-  }, []);
-
-  const seek = useCallback((i) => {
-    const sentences = sentencesRef.current;
-    const clamped = Math.max(0, Math.min(sentences.length - 1, i));
-    const wasPlaying = playingRef.current;
-    window.speechSynthesis?.cancel();
-    idxRef.current = clamped;
-    setCurrentIndex(clamped);
-    if (wasPlaying) {
-      setTimeout(() => speakAt(clamped), 60);
-    }
-  }, [speakAt]);
-
-  const skipForward = useCallback(() => seek(idxRef.current + 2), [seek]);
-  const skipBack = useCallback(() => seek(idxRef.current - 2), [seek]);
-
-  const setVoice = useCallback((v) => {
-    voiceRef.current = v;
-    if (playingRef.current) seek(idxRef.current);
-  }, [seek]);
-
-  const setRate = useCallback((r) => {
-    rateRef.current = r;
-    if (playingRef.current) seek(idxRef.current);
-  }, [seek]);
-
-  const setOnComplete = useCallback((fn) => { onCompleteRef.current = fn; }, []);
-
-  return {
-    voices, isSpeaking, currentIndex,
-    load, play, pause, seek, skipForward, skipBack,
-    setVoice, setRate, setOnComplete,
-  };
-}
-
-// ─────────────────────────────────────────────────────────────────
-// UI bits
+// Components
 // ─────────────────────────────────────────────────────────────────
 function FontsAndStyles() {
   useEffect(() => {
@@ -304,14 +53,13 @@ function FontsAndStyles() {
       @keyframes em-pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.5 } }
       @keyframes em-bar { 0%, 100% { transform: scaleY(0.4) } 50% { transform: scaleY(1) } }
       @keyframes em-fade-up { from { opacity: 0; transform: translateY(8px) } to { opacity: 1; transform: translateY(0) } }
+      @keyframes em-spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
       .em-fade-up { animation: em-fade-up 0.5s ease-out backwards }
       .em-bar { transform-origin: bottom; animation: em-bar 1s ease-in-out infinite }
       .em-bar:nth-child(2) { animation-delay: 0.15s }
       .em-bar:nth-child(3) { animation-delay: 0.3s }
       .em-bar:nth-child(4) { animation-delay: 0.45s }
-      .em-scroll::-webkit-scrollbar { width: 6px }
-      .em-scroll::-webkit-scrollbar-track { background: transparent }
-      .em-scroll::-webkit-scrollbar-thumb { background: ${T.inkFaint}; border-radius: 3px }
+      .em-spin { animation: em-spin 1s linear infinite }
       input.em-input::placeholder, textarea.em-input::placeholder { color: ${T.inkFaint} }
       .em-btn-press:active { transform: scale(0.96) }
     `}</style>
@@ -328,6 +76,122 @@ function PlayingBars({ color = T.bgCard }) {
   );
 }
 
+function AuthMenu({ user, syncState, onSignIn, onSignOut, authReady }) {
+  const [open, setOpen] = useState(false);
+
+  if (!isSupabaseConfigured) {
+    return (
+      <span
+        className="text-xs"
+        style={{ ...fontMono, color: T.inkFaint }}
+        title="Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to enable cloud sync"
+      >
+        local only
+      </span>
+    );
+  }
+
+  if (!authReady) {
+    return <Loader2 size={14} className="em-spin" style={{ color: T.inkFaint }} />;
+  }
+
+  if (!user) {
+    return (
+      <button
+        onClick={onSignIn}
+        className="em-btn-press flex items-center gap-2 px-3 py-1.5 rounded-full text-xs transition-all"
+        style={{ ...fontBody, background: T.ink, color: T.bgCard, fontWeight: 500 }}
+      >
+        <LogIn size={12} />
+        Sign in
+      </button>
+    );
+  }
+
+  const initial = (user.user_metadata?.full_name || user.email || '?')[0].toUpperCase();
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="em-btn-press flex items-center gap-2 px-2 py-1 rounded-full transition-all"
+        style={{ background: T.bgCard, border: `1px solid ${T.line}` }}
+      >
+        {user.user_metadata?.avatar_url ? (
+          <img
+            src={user.user_metadata.avatar_url}
+            alt=""
+            style={{ width: 22, height: 22, borderRadius: 11 }}
+            referrerPolicy="no-referrer"
+          />
+        ) : (
+          <div
+            style={{
+              width: 22, height: 22, borderRadius: 11,
+              background: T.accent, color: T.bgCard,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 11, fontWeight: 600, ...fontBody,
+            }}
+          >
+            {initial}
+          </div>
+        )}
+        <span
+          style={{
+            ...fontMono, fontSize: 10,
+            color: syncState === 'synced' ? T.ok :
+              syncState === 'syncing' ? T.inkMuted :
+              syncState === 'error' ? T.accent : T.inkFaint,
+          }}
+        >
+          {syncState === 'syncing' ? '⋯' : syncState === 'error' ? '✕' : '✓'}
+        </span>
+      </button>
+
+      {open && (
+        <>
+          <div className="fixed inset-0 z-10" onClick={() => setOpen(false)} />
+          <div
+            className="absolute right-0 mt-2 rounded-xl py-1 z-20 em-fade-up"
+            style={{
+              background: T.bgCard,
+              border: `1px solid ${T.line}`,
+              boxShadow: '0 12px 28px -8px rgba(28,20,16,0.25)',
+              minWidth: 220,
+            }}
+          >
+            <div className="px-4 py-2" style={{ borderBottom: `1px solid ${T.lineSoft}` }}>
+              <div style={{ ...fontBody, fontSize: 12, color: T.inkMuted }}>signed in as</div>
+              <div
+                className="truncate"
+                style={{ ...fontDisplay, fontStyle: 'italic', color: T.ink, fontSize: 14 }}
+              >
+                {user.email}
+              </div>
+              <div className="flex items-center gap-1 mt-1" style={{ ...fontMono, fontSize: 10, color: T.inkMuted }}>
+                <Cloud size={10} />
+                {syncState === 'synced' && 'reading list synced'}
+                {syncState === 'syncing' && 'syncing…'}
+                {syncState === 'error' && 'sync error — try refresh'}
+                {syncState === 'idle' && 'ready'}
+              </div>
+            </div>
+            <button
+              onClick={() => { setOpen(false); onSignOut(); }}
+              className="w-full text-left px-4 py-2 text-sm flex items-center gap-2 transition-colors"
+              style={{ ...fontBody, color: T.inkSoft }}
+              onMouseEnter={e => e.currentTarget.style.background = T.bgDeep}
+              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+            >
+              <LogOut size={13} /> Sign out
+            </button>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function AddArticle({ onAdd }) {
   const [mode, setMode] = useState('url');
   const [url, setUrl] = useState('');
@@ -339,9 +203,7 @@ function AddArticle({ onAdd }) {
 
   const submitUrl = async () => {
     if (!url.trim()) return;
-    setLoading(true);
-    setError('');
-    setSuccess('');
+    setLoading(true); setError(''); setSuccess('');
     try {
       const article = await fetchArticleFromURL(url);
       if (!article.text || article.text.length < 50) {
@@ -367,9 +229,9 @@ function AddArticle({ onAdd }) {
       source: 'Pasted',
       url: '',
       addedAt: Date.now(),
+      finished: false,
     });
-    setPasteText('');
-    setPasteTitle('');
+    setPasteText(''); setPasteTitle('');
     setSuccess('Added to your reading list');
     setTimeout(() => setSuccess(''), 2500);
   };
@@ -416,40 +278,28 @@ function AddArticle({ onAdd }) {
       </div>
 
       {mode === 'url' ? (
-        <div>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={url}
-              onChange={e => setUrl(e.target.value)}
-              onKeyDown={e => e.key === 'Enter' && !loading && submitUrl()}
-              placeholder="https://medium.com/..."
-              disabled={loading}
-              className="em-input flex-1 px-4 py-3 rounded-xl text-sm outline-none transition-colors"
-              style={{
-                ...fontBody,
-                background: T.bg,
-                color: T.ink,
-                border: `1px solid ${T.line}`,
-              }}
-              onFocus={e => e.target.style.borderColor = T.accent}
-              onBlur={e => e.target.style.borderColor = T.line}
-            />
-            <button
-              onClick={submitUrl}
-              disabled={loading || !url.trim()}
-              className="em-btn-press flex items-center gap-2 px-5 py-3 rounded-xl text-sm transition-all disabled:opacity-50"
-              style={{
-                ...fontBody,
-                background: T.accent,
-                color: T.bgCard,
-                fontWeight: 600,
-              }}
-            >
-              {loading ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />}
-              {loading ? 'Fetching' : 'Save'}
-            </button>
-          </div>
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={url}
+            onChange={e => setUrl(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && !loading && submitUrl()}
+            placeholder="https://medium.com/..."
+            disabled={loading}
+            className="em-input flex-1 px-4 py-3 rounded-xl text-sm outline-none transition-colors"
+            style={{ ...fontBody, background: T.bg, color: T.ink, border: `1px solid ${T.line}` }}
+            onFocus={e => e.target.style.borderColor = T.accent}
+            onBlur={e => e.target.style.borderColor = T.line}
+          />
+          <button
+            onClick={submitUrl}
+            disabled={loading || !url.trim()}
+            className="em-btn-press flex items-center gap-2 px-5 py-3 rounded-xl text-sm transition-all disabled:opacity-50"
+            style={{ ...fontBody, background: T.accent, color: T.bgCard, fontWeight: 600 }}
+          >
+            {loading ? <Loader2 size={16} className="animate-spin" /> : <Plus size={16} />}
+            {loading ? 'Fetching' : 'Save'}
+          </button>
         </div>
       ) : (
         <div className="space-y-2">
@@ -501,8 +351,7 @@ function AddArticle({ onAdd }) {
 function PlayerCard({
   article, sentences, currentIndex, isSpeaking,
   onPlay, onPause, onSkipBack, onSkipForward, onSeek,
-  rate, onRateChange,
-  voices, currentVoice, onVoiceChange,
+  rate, onRateChange, voices, currentVoice, onVoiceChange,
   totalCount, finishedCount,
 }) {
   const [showSettings, setShowSettings] = useState(false);
@@ -511,20 +360,16 @@ function PlayerCard({
     () => estimateDuration(article?.text || '', rate),
     [article, rate]
   );
-
   const wordsBefore = useMemo(() => {
     if (!sentences.length) return 0;
     return sentences.slice(0, currentIndex).reduce((sum, s) => sum + wordCount(s), 0);
   }, [sentences, currentIndex]);
-
   const totalWords = useMemo(
     () => sentences.reduce((sum, s) => sum + wordCount(s), 0),
     [sentences]
   );
 
-  const elapsed = totalWords > 0
-    ? Math.round((wordsBefore / totalWords) * totalDuration)
-    : 0;
+  const elapsed = totalWords > 0 ? Math.round((wordsBefore / totalWords) * totalDuration) : 0;
   const remaining = Math.max(0, totalDuration - elapsed);
   const progress = sentences.length > 0 ? currentIndex / sentences.length : 0;
 
@@ -555,9 +400,7 @@ function PlayerCard({
   const start = Math.max(0, currentIndex - windowSize);
   const end = Math.min(sentences.length, currentIndex + windowSize + 1);
   const visibleSentences = sentences.slice(start, end).map((s, i) => ({
-    text: s,
-    index: start + i,
-    isCurrent: start + i === currentIndex,
+    text: s, index: start + i, isCurrent: start + i === currentIndex,
   }));
 
   return (
@@ -613,9 +456,7 @@ function PlayerCard({
               >
                 {voices.length === 0 && <option>Loading voices…</option>}
                 {voices.map(v => (
-                  <option key={v.name} value={v.name}>
-                    {v.name} — {v.lang}
-                  </option>
+                  <option key={v.name} value={v.name}>{v.name} — {v.lang}</option>
                 ))}
               </select>
             </div>
@@ -650,11 +491,9 @@ function PlayerCard({
         <h2
           className="leading-[1.05] mb-3"
           style={{
-            ...fontDisplay,
-            color: T.ink,
+            ...fontDisplay, color: T.ink,
             fontSize: 'clamp(28px, 4vw, 44px)',
-            fontWeight: 500,
-            letterSpacing: '-0.02em',
+            fontWeight: 500, letterSpacing: '-0.02em',
           }}
         >
           {article.title}
@@ -666,9 +505,7 @@ function PlayerCard({
             </span>
           )}
           {article.author && <span style={{ color: T.inkFaint }}>·</span>}
-          <span style={{ ...fontMono, fontSize: 12 }}>
-            {formatMinutes(totalDuration)} listen
-          </span>
+          <span style={{ ...fontMono, fontSize: 12 }}>{formatMinutes(totalDuration)} listen</span>
         </div>
       </div>
 
@@ -755,8 +592,7 @@ function PlayerCard({
           onClick={isSpeaking ? onPause : onPlay}
           className="em-btn-press flex items-center justify-center rounded-full transition-all"
           style={{
-            background: T.accent,
-            color: T.bgCard,
+            background: T.accent, color: T.bgCard,
             width: 64, height: 64,
             boxShadow: '0 8px 20px -6px rgba(160,53,32,0.55), inset 0 1px 0 rgba(255,255,255,0.15)',
           }}
@@ -781,11 +617,9 @@ function PlayerCard({
   );
 }
 
-function ListItem({ article, isCurrent, isPlaying, isFinished, rate, onSelect, onRemove, onToggleFinished }) {
-  const duration = useMemo(
-    () => estimateDuration(article.text, rate),
-    [article.text, rate]
-  );
+function ListItem({ article, isCurrent, isPlaying, rate, onSelect, onRemove, onToggleFinished }) {
+  const duration = useMemo(() => estimateDuration(article.text, rate), [article.text, rate]);
+  const isFinished = !!article.finished;
 
   return (
     <div
@@ -803,7 +637,7 @@ function ListItem({ article, isCurrent, isPlaying, isFinished, rate, onSelect, o
         className="flex-shrink-0 flex items-center justify-center rounded-lg"
         style={{
           width: 40, height: 40,
-          background: isCurrent ? T.accent : (isFinished ? T.bgDeep : T.bgDeep),
+          background: isCurrent ? T.accent : T.bgDeep,
           color: isCurrent ? T.bgCard : T.inkSoft,
           border: `1px solid ${isCurrent ? T.accent : T.line}`,
         }}
@@ -818,10 +652,7 @@ function ListItem({ article, isCurrent, isPlaying, isFinished, rate, onSelect, o
         <h3
           className="leading-tight mb-1"
           style={{
-            ...fontDisplay,
-            color: T.ink,
-            fontSize: 16,
-            fontWeight: 500,
+            ...fontDisplay, color: T.ink, fontSize: 16, fontWeight: 500,
             textDecoration: isFinished && !isCurrent ? 'line-through' : 'none',
             textDecorationColor: T.inkFaint,
             display: '-webkit-box',
@@ -881,25 +712,29 @@ function ListItem({ article, isCurrent, isPlaying, isFinished, rate, onSelect, o
 // App
 // ─────────────────────────────────────────────────────────────────
 export default function App() {
+  // Auth (Supabase)
+  const { user, loading: authLoading, signInWithGoogle, signOut } = useAuth();
+
+  // Persisted state (localStorage cache; Supabase for cross-device when signed in)
   const [articles, setArticles] = useLocalStorage('earmark.articles', []);
   const [currentId, setCurrentId] = useLocalStorage('earmark.currentId', null);
   const [rate, setRate] = useLocalStorage('earmark.rate', 1);
   const [voiceName, setVoiceName] = useLocalStorage('earmark.voiceName', null);
-  const [finishedIds, setFinishedIds] = useLocalStorage('earmark.finishedIds', []);
   const [showFinished, setShowFinished] = useLocalStorage('earmark.showFinished', true);
 
   const [currentVoice, setCurrentVoice] = useState(null);
 
+  // Cloud sync (no-op when not signed in or Supabase isn't configured)
+  const { syncState, remoteInsert, remoteUpdate, remoteDelete } =
+    useArticleSync({ user, articles, setArticles });
+
   const speech = useSpeech();
   const { voices } = speech;
 
-  // Apply persisted rate
   useEffect(() => { speech.setRate(rate); }, [rate, speech]);
 
-  // Pick voice once voices load
   useEffect(() => {
     if (voices.length === 0) return;
-    // Try saved voice first
     if (voiceName) {
       const saved = voices.find(v => v.name === voiceName);
       if (saved) {
@@ -908,60 +743,54 @@ export default function App() {
         return;
       }
     }
-    // Fall back to a preferred default
     const preferred = ['Samantha', 'Daniel', 'Karen', 'Moira', 'Google US English', 'Microsoft Aria', 'Alex'];
-    const pick = preferred
-      .map(name => voices.find(v => v.name.includes(name)))
-      .find(Boolean) || voices[0];
+    const pick = preferred.map(name => voices.find(v => v.name.includes(name))).find(Boolean) || voices[0];
     setCurrentVoice(pick);
     speech.setVoice(pick);
     setVoiceName(pick.name);
   }, [voices]); // eslint-disable-line
 
   const currentArticle = articles.find(a => a.id === currentId) || null;
-
   const sentences = useMemo(
     () => currentArticle ? splitIntoSentences(currentArticle.text) : [],
     [currentArticle]
   );
 
-  useEffect(() => {
-    speech.load(sentences);
-  }, [sentences]); // eslint-disable-line
+  useEffect(() => { speech.load(sentences); }, [sentences]); // eslint-disable-line
 
-  // Mark finished + auto-advance
+  // Mark finished + auto-advance to next unread
   useEffect(() => {
     speech.setOnComplete(() => {
-      // Mark current as heard
       if (currentId) {
-        setFinishedIds(prev => prev.includes(currentId) ? prev : [...prev, currentId]);
+        setArticles(prev => prev.map(a => a.id === currentId ? { ...a, finished: true } : a));
+        remoteUpdate(currentId, { finished: true });
       }
-      // Auto-advance to next unfinished
-      const finishedSet = new Set([...(finishedIds || []), currentId]);
-      const remaining = articles.filter(a => !finishedSet.has(a.id) && a.id !== currentId);
+      const remaining = articles.filter(a => !a.finished && a.id !== currentId);
       if (remaining.length > 0) {
         const next = remaining[0];
         setCurrentId(next.id);
         setTimeout(() => speech.play(), 200);
       }
     });
-  }, [articles, currentId, finishedIds, speech, setFinishedIds, setCurrentId]);
+  }, [articles, currentId, speech, setArticles, setCurrentId, remoteUpdate]);
 
+  // Handlers
   const handleAdd = useCallback((article) => {
-    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const id = newArticleId();
     const withId = { ...article, id };
-    setArticles(prev => [withId, ...prev]); // newest first
+    setArticles(prev => [withId, ...prev]);
     if (!currentId) setCurrentId(id);
-  }, [currentId, setArticles, setCurrentId]);
+    remoteInsert(withId);
+  }, [currentId, setArticles, setCurrentId, remoteInsert]);
 
   const handleRemove = useCallback((id) => {
     setArticles(prev => prev.filter(a => a.id !== id));
-    setFinishedIds(prev => prev.filter(x => x !== id));
     if (id === currentId) {
       speech.pause();
       setCurrentId(null);
     }
-  }, [currentId, speech, setArticles, setFinishedIds, setCurrentId]);
+    remoteDelete(id);
+  }, [currentId, speech, setArticles, setCurrentId, remoteDelete]);
 
   const handleSelect = useCallback((id) => {
     if (id === currentId) {
@@ -974,10 +803,18 @@ export default function App() {
   }, [currentId, speech, setCurrentId]);
 
   const handleToggleFinished = useCallback((id) => {
-    setFinishedIds(prev =>
-      prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
-    );
-  }, [setFinishedIds]);
+    let newFinished;
+    setArticles(prev => prev.map(a => {
+      if (a.id === id) {
+        newFinished = !a.finished;
+        return { ...a, finished: newFinished };
+      }
+      return a;
+    }));
+    if (typeof newFinished === 'boolean') {
+      remoteUpdate(id, { finished: newFinished });
+    }
+  }, [setArticles, remoteUpdate]);
 
   const handleRateChange = useCallback((r) => {
     setRate(r);
@@ -991,23 +828,22 @@ export default function App() {
   }, [speech, setVoiceName]);
 
   const handleClearFinished = useCallback(() => {
-    if (!finishedIds.length) return;
-    if (!window.confirm(`Remove ${finishedIds.length} finished article(s) from your list?`)) return;
-    setArticles(prev => prev.filter(a => !finishedIds.includes(a.id)));
-    setFinishedIds([]);
-  }, [finishedIds, setArticles, setFinishedIds]);
+    const finishedItems = articles.filter(a => a.finished);
+    if (!finishedItems.length) return;
+    if (!window.confirm(`Remove ${finishedItems.length} finished article(s) from your list?`)) return;
+    finishedItems.forEach(a => remoteDelete(a.id));
+    setArticles(prev => prev.filter(a => !a.finished));
+  }, [articles, setArticles, remoteDelete]);
 
-  const finishedSet = useMemo(() => new Set(finishedIds), [finishedIds]);
-  const unread = articles.filter(a => !finishedSet.has(a.id) && a.id !== currentId);
-  const finished = articles.filter(a => finishedSet.has(a.id) && a.id !== currentId);
+  const unread = articles.filter(a => !a.finished && a.id !== currentId);
+  const finished = articles.filter(a => a.finished && a.id !== currentId);
+  const finishedCount = articles.filter(a => a.finished).length;
 
   return (
     <div
       className="min-h-screen w-full"
       style={{
-        ...fontBody,
-        background: T.bg,
-        color: T.ink,
+        ...fontBody, background: T.bg, color: T.ink,
         backgroundImage: `
           radial-gradient(at 20% 10%, ${T.bgDeep} 0%, transparent 45%),
           radial-gradient(at 90% 80%, ${T.bgDeep} 0%, transparent 55%),
@@ -1023,11 +859,8 @@ export default function App() {
           <div className="flex items-baseline gap-3">
             <h1
               style={{
-                ...fontDisplay,
-                color: T.ink,
-                fontSize: 32,
-                fontWeight: 500,
-                letterSpacing: '-0.03em',
+                ...fontDisplay, color: T.ink, fontSize: 32,
+                fontWeight: 500, letterSpacing: '-0.03em',
               }}
             >
               Earmark
@@ -1039,26 +872,35 @@ export default function App() {
               · listen to anything
             </span>
           </div>
-          <div
-            className="flex items-center gap-2 text-xs"
-            style={{ ...fontMono, color: T.inkMuted }}
-          >
-            <Volume2 size={12} />
-            {articles.length} saved
+          <div className="flex items-center gap-3">
+            <span
+              className="hidden sm:flex items-center gap-1.5 text-xs"
+              style={{ ...fontMono, color: T.inkMuted }}
+            >
+              <Volume2 size={12} />
+              {articles.length} saved
+            </span>
+            <AuthMenu
+              user={user}
+              syncState={syncState}
+              authReady={!authLoading}
+              onSignIn={signInWithGoogle}
+              onSignOut={signOut}
+            />
           </div>
         </header>
 
         <p
           className="mb-8 em-fade-up"
           style={{
-            ...fontDisplay,
-            fontStyle: 'italic',
-            color: T.inkSoft,
-            fontSize: 18,
+            ...fontDisplay, fontStyle: 'italic',
+            color: T.inkSoft, fontSize: 18,
             animationDelay: '0.05s',
           }}
         >
-          Save your reading list, then listen to it whenever you like.
+          {user
+            ? 'Your reading list, in your ear, on every device.'
+            : 'Save your reading list, then listen to it whenever you like.'}
         </p>
 
         <div className="mb-8" style={{ animationDelay: '0.1s' }}>
@@ -1082,7 +924,7 @@ export default function App() {
             currentVoice={currentVoice}
             onVoiceChange={handleVoiceChange}
             totalCount={articles.length}
-            finishedCount={finishedIds.length}
+            finishedCount={finishedCount}
           />
         </div>
 
@@ -1097,9 +939,7 @@ export default function App() {
                 Reading List
               </h3>
               <div className="flex-1 h-px" style={{ background: T.line }} />
-              <span className="text-xs" style={{ ...fontMono, color: T.inkFaint }}>
-                {unread.length}
-              </span>
+              <span className="text-xs" style={{ ...fontMono, color: T.inkFaint }}>{unread.length}</span>
             </div>
             <div className="space-y-2">
               {unread.map(a => (
@@ -1108,7 +948,6 @@ export default function App() {
                   article={a}
                   isCurrent={false}
                   isPlaying={false}
-                  isFinished={false}
                   rate={rate}
                   onSelect={() => handleSelect(a.id)}
                   onRemove={() => handleRemove(a.id)}
@@ -1131,9 +970,7 @@ export default function App() {
                 Heard {showFinished ? '−' : '+'}
               </button>
               <div className="flex-1 h-px" style={{ background: T.line }} />
-              <span className="text-xs" style={{ ...fontMono, color: T.inkFaint }}>
-                {finished.length}
-              </span>
+              <span className="text-xs" style={{ ...fontMono, color: T.inkFaint }}>{finished.length}</span>
               <button
                 onClick={handleClearFinished}
                 className="text-xs em-btn-press"
@@ -1152,7 +989,6 @@ export default function App() {
                     article={a}
                     isCurrent={false}
                     isPlaying={false}
-                    isFinished={true}
                     rate={rate}
                     onSelect={() => handleSelect(a.id)}
                     onRemove={() => handleRemove(a.id)}
@@ -1169,7 +1005,12 @@ export default function App() {
           style={{ ...fontBody, color: T.inkFaint, borderTop: `1px solid ${T.lineSoft}` }}
         >
           <Sparkles size={10} style={{ display: 'inline', marginRight: 6, verticalAlign: '-1px' }} />
-          Your reading list lives in this browser · TTS by your operating system · Article extraction by Jina Reader
+          {user
+            ? 'Synced across your devices via Supabase'
+            : isSupabaseConfigured
+              ? 'Sign in to sync across devices'
+              : 'Reading list stored in this browser'}
+          {' · '}TTS by your operating system · Article extraction by Jina Reader
         </footer>
       </div>
     </div>

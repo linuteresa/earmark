@@ -389,7 +389,7 @@ function PlayerCard({
         </h2>
         <p className="text-sm" style={{ ...fontBody, color: T.inkMuted }}>
           {totalCount === 0
-            ? 'Paste a Medium URL above to start your reading list.'
+            ? 'Paste any URL of something you would like to read, above, to start your reading list.'
             : `${totalCount - finishedCount} unread, ${finishedCount} finished. Tap an article below.`}
         </p>
       </div>
